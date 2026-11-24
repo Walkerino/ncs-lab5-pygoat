@@ -77,3 +77,77 @@ jobs:
         with:
           name: docker-scout-findings
           path: scout-report.sarif
+
+  dast_scan:
+    # No "needs": sast_scan and image_scan fail on findings by design,
+    # and a dependent job would then be skipped without a DAST result.
+    name: Deploy PyGoat and Run ZAP Baseline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build PyGoat image from this repository
+        run: docker build -f Dockerfile -t pygoat-dast:${{ github.sha }} .
+
+      - name: Start PyGoat
+        run: |
+          docker run -d --name pygoat -p 8000:8000 pygoat-dast:${{ github.sha }}
+          # The image ships without a database, so create the SQLite schema first.
+          docker exec pygoat python manage.py migrate --noinput
+
+      - name: Wait until PyGoat is ready
+        run: |
+          if ! curl -fsS -o /dev/null --retry 30 --retry-delay 2 --retry-all-errors \
+               -w "Readiness: GET /login/ -> HTTP %{http_code}\n" http://localhost:8000/login/; then
+            docker logs pygoat
+            exit 1
+          fi
+          docker ps --filter name=pygoat
+
+      - name: Run ZAP baseline (passive) scan
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker pull -q ghcr.io/zaproxy/zaproxy:stable
+          docker image inspect --format 'ZAP image: {{index .RepoDigests 0}}' ghcr.io/zaproxy/zaproxy:stable
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:8000 -m 1 \
+            -J zap-report.json -r zap-report.html -w zap-report.md
+
+      - name: Summarize ZAP alerts
+        if: always()
+        run: |
+          if [[ ! -f zap/zap-report.json ]]; then
+            echo "No ZAP report was produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import collections, json
+          report = json.load(open("zap/zap-report.json"))
+          alerts = [a for site in report["site"] for a in site["alerts"]]
+          counts = collections.Counter(a["riskdesc"].split(" ")[0] for a in alerts)
+          print(f"### ZAP {report['@version']} baseline: {', '.join(s['@name'] for s in report['site'])}")
+          print("| Risk | Alert types |\n|---|---|")
+          for risk in ("High", "Medium", "Low", "Informational"):
+              print(f"| {risk} | {counts.get(risk, 0)} |")
+          print("\n| Risk (confidence) | Plugin | CWE | Instances | Alert |\n|---|---|---|---|---|")
+          for a in alerts:
+              print(f"| {a['riskdesc']} | {a['pluginid']} | {a['cweid']} | {a['count']} | {a['name']} |")
+          PY
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ZAP Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-baseline-findings
+          path: zap/zap-report.*
+          if-no-files-found: warn
+
+      - name: Stop PyGoat
+        if: always()
+        run: |
+          docker logs --tail 50 pygoat || true
+          docker rm -f pygoat || true
